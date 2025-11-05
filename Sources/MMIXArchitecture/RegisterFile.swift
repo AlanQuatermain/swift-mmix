@@ -31,6 +31,7 @@ public struct MMIXRegisterFile: Sendable {
     /// Register offset - where logical `$0` maps to in physical hardware.
     ///
     /// This is just a quick accessor/converter for `special[.rO]`.
+    @inline(__always)
     private var rO: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rO)) }
         set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rO) }
@@ -39,6 +40,7 @@ public struct MMIXRegisterFile: Sendable {
     /// Register stack pointer - total octabytes in memory stack.
     ///
     /// This is just a quick accessor/converter for `special[.rS]`.
+    @inline(__always)
     private var rS: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rS)) }
         set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rS) }
@@ -47,7 +49,8 @@ public struct MMIXRegisterFile: Sendable {
     /// Local register threshold.
     ///
     /// This is just a quick accessor/converter for `special[.rL]`.
-    public private(set) var rL: Int {
+    @inline(__always)
+    private var rL: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rL)) }
         set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rL) }
     }
@@ -55,7 +58,8 @@ public struct MMIXRegisterFile: Sendable {
     /// Global register threshold.
     ///
     /// This is just a quick accessor/converter for `special[.rG]`.
-    public private(set) var rG: Int {
+    @inline(__always)
+    private var rG: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rG)) }
         set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rG)}
     }
@@ -79,12 +83,15 @@ public struct MMIXRegisterFile: Sendable {
     //   - Shrinking/moving α backward may require FILLs while α would cross γ.
 
     /// Start of current frame's locals within the register ring.
+    @inline(__always)
     private var alpha: Int  { (rO >> 3) & 0xFF }
 
     /// Past-end of current frame's local window (α + `rL`).
+    @inline(__always)
     private var beta: Int   { (alpha &+ rL) & 0xFF }
 
     /// Start of oldest resident local registers not yet spilled.
+    @inline(__always)
     private var gamma: Int  { (rS >> 3) & 0xFF }
 
     // MARK: Initialization
@@ -94,68 +101,89 @@ public struct MMIXRegisterFile: Sendable {
 
         self.general = .init(repeating: .zero, count: 256)
         self.special = .init(repeating: .zero)
+        self.memoryStack = []
         self.rL = L
         self.rG = G
-        self.memoryStack = []
     }
 
 
     // MARK: Physical/Logical Register Mappings
 
     /// Map logical local index i (`0 <= i < rL`) to physical register.
-    private func physical(for local: Int) -> Int {
-        precondition(local >= 0 && local < rL, "local index out of range")
-        return (alpha &+ local) & 0xFF
+    @inline(__always)
+    private func physical(for logical: Int) -> Int {
+        precondition(logical >= 0 && logical < 256, "logical index out of range")
+        if logical < rG {
+            return (alpha &+ logical) & 0xFF
+        } else {
+            // Globals are at fixed indices
+            return logical
+        }
     }
+
+    @inline(__always)
+    private func isLocal(_ i: Int) -> Bool { i < rL }
+    @inline(__always)
+    private func isMarginal(_ i: Int) -> Bool { i >= rL && i < rG }
+    @inline(__always)
+    private func isGlobal(_ i: Int) -> Bool { i >= rG }
 
 
     // MARK: Register Stack Spills
 
-    /// Check if pushing would require spilling registers.
-    private func needsSpill(pushingBy count: Int) -> Bool {
-        let newRO = (rO + count) % rG
-
-        // Active region: [rO, rO + L]
-        let activeStart = rO
-        let activeEnd = (rO + rL) % rG
-
-        func rangesOverlap(s1: Int, l1: Int, s2: Int, l2: Int, m: Int) -> Bool {
-            let e1 = (s1 + l1) % m
-            let e2 = (s2 + l2) % m
-
-            // Handle wraparound cases
-            if s1 <= e1 && s2 <= e2 {
-                // Neither wraps
-                return !(e1 <= s2 || e2 <= s1)
-            }
-            else if s1 > e1 && s2 > e2 {
-                // Both wrap -- they must overlap
-                return true
-            }
-            else if s1 > e1 {
-                // First range wraps.
-                // Range 1 occupies [s1, m) and [0, e1).
-                // Gap is [e1, s1).
-                // They overlap if range 2 is not ENTIRELY within that gap
-                return !(s2 >= e1 && e2 <= s1)
-            }
-            else {
-                // Second range wraps.
-                // Range 2 occupies [s2, m) and [0, e2).
-                // Gap is [e2, s2).
-                // They overlap if range 1 is not ENTIRELY within that gap
-                return !(s1 >= e2 && e1 <= s2)
-            }
-        }
-
-        // Check if new frame position would overlap with active region.
-        // This requires checking circular range overlap.
-        return rangesOverlap(
-            s1: newRO, l1: count, s2: activeStart, l2: Int(L), m: Int(G))
+    /// Spill a single register onto the stack.
+    private mutating func spillOne() {
+        // Spill l[γ] -> memory at rS, then advance rS (γ := γ + 1)
+        memoryStack.append(general[gamma])
+        rS &+= 8
     }
 
+    /// Fill one register from the stack.
+    private mutating func fillOne() {
+        precondition(!memoryStack.isEmpty, "register stack underflow")
+
+        // Move pointer back to point at fill destination
+        rS &-= 8
+        // Fill that register by popping from the stack
+        general[gamma] = memoryStack.removeLast()
+    }
+
+    /// Ensure we have room to grow the locals window, spilling as needed.
+    private mutating func ensureCapacityForGrowth(by delta: Int) {
+        precondition(delta >= 0)
+        for _ in 0 ..< delta {
+            // avoid β == γ
+            if beta == gamma { spillOne() }
+            // grow window by 1 (β :=  + 1)
+            rL &+= 1
+        }
+    }
+
+    /// Move the window location (α) backward, filling as needed.
+    ///
+    /// Typically used during `POP` instructions.
+    private mutating func moveAlphaBackward(by delta: Int) {
+        precondition(delta >= 0)
+        for _ in 0 ..< delta {
+            // avoid α crossing γ
+            if alpha == gamma { fillOne() }
+            // α := α - 1
+            rO &-= 8
+        }
+    }
 
     // MARK: General Register Access
+
+    @inline(__always)
+    private func readPhys(_ i: Int) -> Octa {
+        i == 0 ? .zero : general[i]
+    }
+
+    @inline(__always)
+    private mutating func writePhys(_ v: Octa, _ i: Int) {
+        guard i != 0 else { return }
+        general[i] = v
+    }
 
     /// Read general register.
     ///
@@ -166,15 +194,8 @@ public struct MMIXRegisterFile: Sendable {
     /// - `L <= i < G`: return `0` (marginal)
     /// - `i >= G`: return register value (global)
     public func readGeneral(_ index: Int) -> Octa {
-        precondition(index < 256)
-        guard index != 0 else { return .zero }
-
-        if index < L || index >= G {
-            return general[index]
-        } else {
-            // Marginal register reads as zero.
-            return .zero
-        }
+        precondition(index >= 0 && index < 256)
+        return isMarginal(index) ? .zero : readPhys(physical(for: index))
     }
 
     /// Write general register.
@@ -186,29 +207,17 @@ public struct MMIXRegisterFile: Sendable {
     /// - `L <= i < G`: grow L, clear intervening registers, write
     /// - `i >= G`: write to register (global)
     public mutating func writeGeneral(_ value: Octa, to index: Int) {
-        precondition(index < 256)
-        guard index != 0 else { return }
+        precondition(index >= 0 && index < 256)
 
-        if index < L {
-            // Local register - direct write
-            general[index] = value
+        if isMarginal(index) {
+            // Promote up to (and including) index
+            let delta = (index - rL) + 1
+            ensureCapacityForGrowth(by: delta)
+            // After growth, $index is local; fall through to write it
         }
-        else if index < G {
-            // Writing marginal register grows L.
-            // Clear all registers from old L through index.
-            for i in Int(L)..<index {
-                general[i] = .zero
-            }
-            general[index] = value
-            L = UInt8(index + 1)
 
-            // Update rL special register.
-            writeSpecial(Octa(UInt64(L)), to: .rL)
-        }
-        else {
-            // Global register - direct write
-            general[index] = value
-        }
+        // locals or globals write directly
+        writePhys(value, physical(for: index))
     }
 
     // MARK: Special Registers
@@ -341,15 +350,24 @@ public struct MMIXRegisterFile: Sendable {
         _ value: Octa, to register: SpecialRegister
     ) {
         special[register.rawValue] = value
-
-        // Handle side effects
         switch register {
-        case .rL:
-            L = UInt8(truncatingIfNeeded: value.storage)
-        case .rG:
-            G = UInt8(truncatingIfNeeded: value.storage)
         case .rS:
-            stackPointer = Int(value.storage)
+            // Ensure memory stack size matches; instructions can technically
+            // overwrite this value directly.
+            let want = Int(truncatingIfNeeded: value.storage) >> 3
+            if want > memoryStack.count {
+                // extend with zeroes (zero-fill makes for nicer visualization)
+                memoryStack.append(
+                    contentsOf: repeatElement(
+                        .zero, count: want - memoryStack.count))
+            } else if want < memoryStack.count {
+                // trim the memory region; we use append/removeLast, so we will
+                // trim to ensure those continue to work as expected, rather
+                // than eliding the trim and just ignoring the values.
+                // Swift will likely elide the trim internally if it's small
+                // enough.
+                memoryStack.removeLast(memoryStack.count - want)
+            }
         default:
             break
         }
@@ -357,70 +375,52 @@ public struct MMIXRegisterFile: Sendable {
 
     // MARK: Register Stack Operations
 
-    /// PUSH operation (for `PUSHJ`/`PUSHGO`).
+    /// Slides the register window forward past the current frame's locals.
     ///
-    /// Shifts the local register window by the specified number of arguments.
-    public mutating func push(argumentCount: Int) {
-        precondition(
-            argumentCount >= 0 && argumentCount <= Int(L),
-            "Invalid argument count: \(argumentCount)")
-
-        // Save registers from 0 to L-1 (excluding arguments)
-        let saveCount = Int(L) - argumentCount
-        let newRO = (rO + saveCount) % Int(G)
-
-        // Check if we need to spill to memory.
-        if needsSpill(pushingBy: saveCount) {
-            // Calculate how many registers to spill
-            let spillCount = calculateSpillCount(
-                newRO: newRO, argumentCount: argumentCount)
-        }
+    /// - Returns: Number of locals on the stack frame being replaced.
+    public mutating func pushFrame() -> Int {
+        let result = rL
+        rO &+= rL &* 8
+        return result
     }
 
-    /// POP operation (for `POP` instruction)
+    /// Pop the given frame, restoring a previous rL value.
     ///
-    /// Restores local registers from stack.  Returns register count restored.
-    public mutating func pop(returnValueCount: Int = 0) -> Int {
-        // Determine how many to restore
-        let offset = Int(readSpecial(.rO).storage)
-        let restoreCount = min(stackPointer, 256 - offset)
-        guard restoreCount > 0 else {
-            L = UInt8(returnValueCount)
-            return 0
+    /// - Parameters:
+    ///   - previousL: Number of local variables on the prior stack frame.
+    public mutating func popFrame(ofSize size: Int) {
+        // If the callee still has locals, shrink them first (no fill/spill).
+        if rL > 0 {
+            rL = 0
         }
 
-        // Restore from stack
-        let startIndex = stack.count - restoreCount
-        let restored = stack[startIndex...]
-        for (i, value) in restored.enumerated() {
-            general[returnValueCount + i] = value
-        }
+        // Slide window backward; this may fill from the stack.
+        moveAlphaBackward(by: size)
 
-        stack.removeLast(restoreCount)
-        stackPointer -= restoreCount
-
-        L = UInt8(returnValueCount + restoreCount)
-
-        // Update special registers
-        special[SpecialRegister.rO.rawValue] = .zero
-        special[SpecialRegister.rS.rawValue] = Octa(UInt64(stackPointer))
-
-        return restoreCount
+        // Restore the caller's local register count.
+        rL = size
     }
+
+
+    // MARK: Debugging/Visualization Aids
 
     /// Get all local registers (for debugging).
     public var locals: [Octa] {
-        Array(general[..<Int(L)])
+        if alpha < beta {
+            Array(general[alpha..<beta])
+        } else {
+            Array(general[alpha..<rG]) + Array(general[..<beta])
+        }
     }
 
     /// Get all global registers (for debugging).
     public var globals: [Octa] {
-        Array(general[Int(G)...])
+        Array(general[rG...])
     }
 
     /// Get general register information (for debugging/visualization).
-    public var generalRegisters: ([Octa], L: Int, G: Int) {
-        (general, Int(L), Int(G))
+    public var generalRegisters: ([Octa], O: Int, L: Int, G: Int) {
+        (.init(general), rO, rL, rG)
     }
 }
 
