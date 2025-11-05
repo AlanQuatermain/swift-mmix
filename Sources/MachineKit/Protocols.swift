@@ -53,11 +53,3 @@ public enum ComparisonResult: Int, Sendable, Equatable {
     case equal = 0
     case greater = 1
 }
-
-/// Temporary helper used by placeholder code and tests to verify the
-/// module graph until real implementations land.
-public enum MachineKitPlaceholder {
-    public static func bootstrapSummary() -> String {
-        "MachineKit:Ready"
-    }
-}

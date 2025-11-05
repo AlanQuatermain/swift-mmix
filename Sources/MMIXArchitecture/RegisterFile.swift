@@ -23,35 +23,135 @@ public struct MMIXRegisterFile: Sendable {
     // MARK: Storage
 
     /// General-purpose registers.
-    private var general: [Octa]
+    private var general: ContiguousArray<Octa>
 
     /// Special registers.
-    private var special: [Octa]
+    private var special: InlineArray<32, Octa>
+
+    /// Register offset - where logical `$0` maps to in physical hardware.
+    ///
+    /// This is just a quick accessor/converter for `special[.rO]`.
+    private var rO: Int {
+        get { Int(truncatingIfNeeded: readSpecial(.rO)) }
+        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rO) }
+    }
+
+    /// Register stack pointer - total octabytes in memory stack.
+    ///
+    /// This is just a quick accessor/converter for `special[.rS]`.
+    private var rS: Int {
+        get { Int(truncatingIfNeeded: readSpecial(.rS)) }
+        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rS) }
+    }
 
     /// Local register threshold.
-    public private(set) var L: UInt8
+    ///
+    /// This is just a quick accessor/converter for `special[.rL]`.
+    public private(set) var rL: Int {
+        get { Int(truncatingIfNeeded: readSpecial(.rL)) }
+        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rL) }
+    }
 
     /// Global register threshold.
-    public private(set) var G: UInt8
+    ///
+    /// This is just a quick accessor/converter for `special[.rG]`.
+    public private(set) var rG: Int {
+        get { Int(truncatingIfNeeded: readSpecial(.rG)) }
+        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rG)}
+    }
 
     /// Register stack (for procedure calls).
-    private var stack: [Octa]
+    private var memoryStack: [Octa]
 
-    /// Stack pointer (number of registers on stack).
-    private var stackPointer: Int
+    // ===== α/β/γ (ring pointers) =====
+    // α = start of current frame’s locals
+    // β = just past the end (α + rL)
+    // γ = start of the “older-but-still-resident” tail (oldest locals not yet
+    // spilled to memory)
+    //
+    // We store α and γ *implicitly* via rO and rS:
+    //   α = (rO / 8) mod 256
+    //   β = (α + rL) mod 256
+    //   γ = (rS / 8) mod 256
+    //
+    // The invariants:
+    //   - Growing rL may require SPILLs while (β == γ) would occur.
+    //   - Shrinking/moving α backward may require FILLs while α would cross γ.
 
+    /// Start of current frame's locals within the register ring.
+    private var alpha: Int  { (rO >> 3) & 0xFF }
+
+    /// Past-end of current frame's local window (α + `rL`).
+    private var beta: Int   { (alpha &+ rL) & 0xFF }
+
+    /// Start of oldest resident local registers not yet spilled.
+    private var gamma: Int  { (rS >> 3) & 0xFF }
 
     // MARK: Initialization
 
-    public init(L: UInt8 = 0, G: UInt8 = 255) {
+    public init(L: Int = 0, G: Int = 255) {
         precondition(L <= G, "L must be <= G")
 
-        self.general = Array(repeating: .zero, count: 256)
-        self.special = Array(repeating: .zero, count: 32)
-        self.L = L
-        self.G = G
-        self.stack = []
-        self.stackPointer = 0
+        self.general = .init(repeating: .zero, count: 256)
+        self.special = .init(repeating: .zero)
+        self.rL = L
+        self.rG = G
+        self.memoryStack = []
+    }
+
+
+    // MARK: Physical/Logical Register Mappings
+
+    /// Map logical local index i (`0 <= i < rL`) to physical register.
+    private func physical(for local: Int) -> Int {
+        precondition(local >= 0 && local < rL, "local index out of range")
+        return (alpha &+ local) & 0xFF
+    }
+
+
+    // MARK: Register Stack Spills
+
+    /// Check if pushing would require spilling registers.
+    private func needsSpill(pushingBy count: Int) -> Bool {
+        let newRO = (rO + count) % rG
+
+        // Active region: [rO, rO + L]
+        let activeStart = rO
+        let activeEnd = (rO + rL) % rG
+
+        func rangesOverlap(s1: Int, l1: Int, s2: Int, l2: Int, m: Int) -> Bool {
+            let e1 = (s1 + l1) % m
+            let e2 = (s2 + l2) % m
+
+            // Handle wraparound cases
+            if s1 <= e1 && s2 <= e2 {
+                // Neither wraps
+                return !(e1 <= s2 || e2 <= s1)
+            }
+            else if s1 > e1 && s2 > e2 {
+                // Both wrap -- they must overlap
+                return true
+            }
+            else if s1 > e1 {
+                // First range wraps.
+                // Range 1 occupies [s1, m) and [0, e1).
+                // Gap is [e1, s1).
+                // They overlap if range 2 is not ENTIRELY within that gap
+                return !(s2 >= e1 && e2 <= s1)
+            }
+            else {
+                // Second range wraps.
+                // Range 2 occupies [s2, m) and [0, e2).
+                // Gap is [e2, s2).
+                // They overlap if range 1 is not ENTIRELY within that gap
+                return !(s1 >= e2 && e1 <= s2)
+            }
+        }
+
+        // Check if new frame position would overlap with active region.
+        // This requires checking circular range overlap.
+        return rangesOverlap(
+            s1: newRO, l1: count, s2: activeStart, l2: Int(L), m: Int(G))
     }
 
 
@@ -259,29 +359,22 @@ public struct MMIXRegisterFile: Sendable {
 
     /// PUSH operation (for `PUSHJ`/`PUSHGO`).
     ///
-    /// Saves local registers `L-argumentCount...L-1` to stack.  Sets new `L` to
-    /// `argumentCount`.
+    /// Shifts the local register window by the specified number of arguments.
     public mutating func push(argumentCount: Int) {
         precondition(
             argumentCount >= 0 && argumentCount <= Int(L),
             "Invalid argument count: \(argumentCount)")
 
         // Save registers from 0 to L-1 (excluding arguments)
-        let saveStart = argumentCount
         let saveCount = Int(L) - argumentCount
+        let newRO = (rO + saveCount) % Int(G)
 
-        if saveCount > 0 {
-            let saved = general[saveStart..<Int(L)]
-            stack.append(contentsOf: saved)
-            stackPointer += saveCount
+        // Check if we need to spill to memory.
+        if needsSpill(pushingBy: saveCount) {
+            // Calculate how many registers to spill
+            let spillCount = calculateSpillCount(
+                newRO: newRO, argumentCount: argumentCount)
         }
-
-        // Arguments stay in place, become new locals
-        L = UInt8(argumentCount)
-
-        // Update rO (stack offset) and rS (stack pointer)
-        special[SpecialRegister.rO.rawValue] = Octa(UInt64(saveStart))
-        special[SpecialRegister.rS.rawValue] = Octa(UInt64(stackPointer))
     }
 
     /// POP operation (for `POP` instruction)
