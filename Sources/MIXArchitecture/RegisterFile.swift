@@ -90,8 +90,11 @@ public struct MIXRegisterFile: Sendable {
         // Compute EA with wrapping
         let ea = Int(base.value) + Int(indexAddr)
 
-        // Wrap to 12 bits (0–4095)
-        let wrapped = ea & 0x0FFF
+        // MIX can address 4000 words
+        var wrapped = ea % 4000
+        if wrapped < 0 {
+            wrapped += 4000
+        }
         return MIXAddress(UInt16(wrapped))
     }
 

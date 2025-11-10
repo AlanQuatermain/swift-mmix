@@ -43,7 +43,7 @@ public struct MMIXRegisterFile: Sendable {
     @inline(__always)
     private var rS: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rS)) }
-        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rS) }
+        set { _writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rS) }
     }
 
     /// Local register threshold.
@@ -52,7 +52,7 @@ public struct MMIXRegisterFile: Sendable {
     @inline(__always)
     private var rL: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rL)) }
-        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rL) }
+        set { _writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rL) }
     }
 
     /// Global register threshold.
@@ -61,17 +61,23 @@ public struct MMIXRegisterFile: Sendable {
     @inline(__always)
     private var rG: Int {
         get { Int(truncatingIfNeeded: readSpecial(.rG)) }
-        set { writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rG)}
+        set { _writeSpecial(.init(UInt64(bitPattern: .init(newValue))), to: .rG)}
     }
 
     /// Register stack (for procedure calls).
     private var memoryStack: [Octa]
+
+    // MARK: - Register Ring Handling
 
     // ===== α/β/γ (ring pointers) =====
     // α = start of current frame’s locals
     // β = just past the end (α + rL)
     // γ = start of the “older-but-still-resident” tail (oldest locals not yet
     // spilled to memory)
+    //
+    // Note that the size of the ring is equal to `rG`. i.e. if `rG == 128`,
+    // then the local/marginal ring operates on hardware registers `0...127`.
+    // This means that we should always wrap α/β/γ at `rG`, not just `255`.
     //
     // We store α and γ *implicitly* via rO and rS:
     //   α = (rO / 8) mod 256
@@ -82,17 +88,56 @@ public struct MMIXRegisterFile: Sendable {
     //   - Growing rL may require SPILLs while (β == γ) would occur.
     //   - Shrinking/moving α backward may require FILLs while α would cross γ.
 
-    /// Start of current frame's locals within the register ring.
+    /// The current size of the local/marginal register ring.
     @inline(__always)
-    private var alpha: Int  { (rO >> 3) & 0xFF }
+    private var registerRingSize: Int { rG }
+
+    /// Apply a modulus based on the current size of the local/marginal ring.
+    @inline(__always)
+    private func ringModulo(_ value: Int) -> Int {
+        let size = registerRingSize
+        if size.isPowerOf2 {
+            return value & (size - 1)
+        }
+        precondition(size > 0, "Local/marginal ring should always have at least one register")
+        let y = value % size
+        return y >= 0 ? y : y + size
+    }
+
+    private func wrapAdd(_ x: Int, _ k: Int) -> Int {
+        let size = registerRingSize
+        if size.isPowerOf2 {
+            return (x &+ k) & (size - 1)
+        }
+
+        let y = x &+ k
+        return if y >= size {
+            y - size
+        } else if y < 0 {
+            y + size
+        } else {
+            y
+        }
+    }
+
+    @inline(__always)
+    private func wrapInc(_ x: Int) -> Int {
+        wrapAdd(x, 1)
+    }
+
+    @inline(__always)
+    private func wrapDec(_ x: Int) -> Int {
+        wrapAdd(x, -1)
+    }
+
+    /// Start of current frame's locals within the register ring.
+    private var alpha: Int = 0
 
     /// Past-end of current frame's local window (α + `rL`).
-    @inline(__always)
-    private var beta: Int   { (alpha &+ rL) & 0xFF }
+    private var beta: Int = 0
 
     /// Start of oldest resident local registers not yet spilled.
-    @inline(__always)
-    private var gamma: Int  { (rS >> 3) & 0xFF }
+    private var gamma: Int = 0
 
     // MARK: Initialization
 
@@ -102,8 +147,10 @@ public struct MMIXRegisterFile: Sendable {
         self.general = .init(repeating: .zero, count: 256)
         self.special = .init(repeating: .zero)
         self.memoryStack = []
-        self.rL = L
-        self.rG = G
+
+        // Use side-effects when setting these.
+        writeSpecial(.init(L), to: .rL)
+        writeSpecial(.init(G), to: .rG)
     }
 
 
@@ -114,7 +161,7 @@ public struct MMIXRegisterFile: Sendable {
     private func physical(for logical: Int) -> Int {
         precondition(logical >= 0 && logical < 256, "logical index out of range")
         if logical < rG {
-            return (alpha &+ logical) & 0xFF
+            return wrapAdd(alpha, logical)
         } else {
             // Globals are at fixed indices
             return logical
@@ -136,6 +183,7 @@ public struct MMIXRegisterFile: Sendable {
         // Spill l[γ] -> memory at rS, then advance rS (γ := γ + 1)
         memoryStack.append(general[gamma])
         rS &+= 8
+        gamma = wrapInc(gamma)
     }
 
     /// Fill one register from the stack.
@@ -144,31 +192,45 @@ public struct MMIXRegisterFile: Sendable {
 
         // Move pointer back to point at fill destination
         rS &-= 8
+        // γ := γ - 1
+        gamma = wrapDec(gamma)
         // Fill that register by popping from the stack
         general[gamma] = memoryStack.removeLast()
     }
 
-    /// Ensure we have room to grow the locals window, spilling as needed.
+    /// Ensure we have room to grow the locals window, spilling if β would
+    /// *collide* with γ as a result of the growth.
     private mutating func ensureCapacityForGrowth(by delta: Int) {
         precondition(delta >= 0)
         for _ in 0 ..< delta {
-            // avoid β == γ
-            if beta == gamma { spillOne() }
+            // avoid causing β == γ when we increment
+            let nextBeta = wrapInc(beta)
+            if nextBeta == gamma { spillOne() }
             // grow window by 1 (β :=  + 1)
             rL &+= 1
+            beta = nextBeta
         }
     }
 
-    /// Move the window location (α) backward, filling as needed.
+    /// Move the window location (α) backward, filling if α would *collide* with
+    /// γ as a result of the change.
     ///
     /// Typically used during `POP` instructions.
     private mutating func moveAlphaBackward(by delta: Int) {
         precondition(delta >= 0)
         for _ in 0 ..< delta {
             // avoid α crossing γ
-            if alpha == gamma { fillOne() }
+            let nextAlpha = wrapDec(alpha)
+            // avoid all-empty state when we roll back to having nothing on
+            // stack but initial alpha & gamma are both zero.
+            if nextAlpha == gamma && !memoryStack.isEmpty {
+                fillOne()
+            }
             // α := α - 1
             rO &-= 8
+            alpha = nextAlpha
+            // Keep β consistent with rL
+            beta = wrapAdd(alpha, rL)
         }
     }
 
@@ -349,9 +411,10 @@ public struct MMIXRegisterFile: Sendable {
     public mutating func writeSpecial(
         _ value: Octa, to register: SpecialRegister
     ) {
-        special[register.rawValue] = value
         switch register {
         case .rS:
+            _writeSpecial(value, to: register)
+
             // Ensure memory stack size matches; instructions can technically
             // overwrite this value directly.
             let want = Int(truncatingIfNeeded: value.storage) >> 3
@@ -368,9 +431,48 @@ public struct MMIXRegisterFile: Sendable {
                 // enough.
                 memoryStack.removeLast(memoryStack.count - want)
             }
+        case .rG:
+            // Cache old value
+            let oldG = rG
+            // Update register
+            _writeSpecial(value, to: register)
+            // Cache new value
+            let newG = rG
+            precondition(newG >= 0 && newG <= 256 && rL <= newG)
+
+            // Re-wrap pointers into the new ring size.
+            if oldG != 0 && newG != 0 {
+                alpha %= newG;
+                if alpha < 0 {
+                    alpha += newG
+                }
+                beta = wrapAdd(alpha, rL)
+                gamma %= newG
+                if gamma < 0 {
+                    gamma += newG
+                }
+            } else {
+                alpha = 0
+                beta = rL % max(newG, 1)
+                gamma = 0
+            }
+        case .rO:
+            _writeSpecial(value, to: register)
+            alpha = (Int(truncatingIfNeeded: value) >> 3) % rG
+            // Keep β consistent
+            beta = wrapAdd(alpha, rL)
         default:
+            _writeSpecial(value, to: register)
             break
         }
+    }
+
+    /// Internal version of `writeSpecial` with no side-effects.
+    @inline(__always)
+    private mutating func _writeSpecial(
+        _ value: Octa, to register: SpecialRegister
+    ) {
+        special[register.rawValue] = value
     }
 
     // MARK: Register Stack Operations
@@ -450,5 +552,19 @@ extension MMIXRegisterFile: RegisterFile {
         case .special(let special):
             writeSpecial(value, to: special)
         }
+    }
+}
+
+// MARK: - Test Access
+
+extension MMIXRegisterFile {
+    /// Expose ring pointers for testing.
+    internal func ringPointers() -> (alpha: Int, beta: Int, gamma: Int) {
+        (alpha, beta, gamma)
+    }
+
+    /// Expose rO/rS/rL/rG for testing.
+    internal func stackState() -> (rO: Int, rS: Int, rL: Int, rG: Int) {
+        (rO, rS, rL, rG)
     }
 }
